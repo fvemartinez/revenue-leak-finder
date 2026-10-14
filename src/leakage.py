@@ -61,6 +61,21 @@ class FunnelResult:
     priority_stage: str = ""
 
 
+def _revenue_from_rates(inp: FunnelInputs, rates: Dict[str, float]) -> float:
+    """Compute revenue given an explicit rates mapping without computing marginals.
+
+    This helper avoids recursion and provides a numerically stable way to
+    compute the effect of changing a single rate by simulation rather than
+    relying on analytical division which is undefined for p=0.
+    """
+    clicks = inp.monthly_ad_spend / inp.cpc if inp.cpc > 0 else 0.0
+    running = clicks
+    for k in STAGE_LABELS:
+        running = running * rates.get(k, 0.0)
+    sales = running
+    return sales * inp.avg_ticket
+
+
 def compute(inp: FunnelInputs) -> FunnelResult:
     clicks = inp.monthly_ad_spend / inp.cpc
 
@@ -76,22 +91,20 @@ def compute(inp: FunnelInputs) -> FunnelResult:
     cac = (inp.monthly_ad_spend / sales) if sales > 0 else 0.0
     roas = (revenue / inp.monthly_ad_spend) if inp.monthly_ad_spend > 0 else 0.0
 
-    # Marginal economic impact: revenue if this stage's rate rises by 1
-    # percentage point (absolute), all else equal. Because revenue is
-    # multiplicative in the rates, d(Revenue)/d(p_i) = Revenue / p_i.
-    # Improvement of +0.01 absolute -> Revenue/p_i * (p_i + 0.01) - Revenue.
+    # Marginal economic impact: explicit simulation of +1 percentage point
+    # (absolute) on each stage, all else equal. We simulate because the
+    # analytic derivative Revenue/p is undefined when p == 0 and may be
+    # numerically unstable for very small p.
     marginal: Dict[str, float] = {}
     for k in STAGE_LABELS:
         p = inp.rates[k]
-        if p > 0:
-            new_rev = revenue / p * (p + 0.01)
-            marginal[k] = new_rev - revenue
-        else:
-            # If a stage is fully closed (p=0), revenue is already 0; opening it
-            # cannot be ranked by this multiplicative derivative. Flag as inf-like
-            # by using the max possible unlock: clicks-through times ticket * 0.01.
-            marginal[k] = float("inf")
+        bumped = dict(inp.rates)
+        bumped[k] = min(1.0, p + 0.01)
+        new_revenue = _revenue_from_rates(inp, bumped)
+        marginal[k] = new_revenue - revenue
 
+    # Deterministic ranking (stable across runs). In case of ties, Python's
+    # sorted is stable and will preserve the STAGE_LABELS relative order.
     ranking = sorted(STAGE_LABELS, key=lambda k: marginal[k], reverse=True)
     priority = ranking[0]
 
@@ -128,12 +141,15 @@ def scenario(inp: FunnelInputs, relative_uplift: float) -> Dict[str, float]:
         gross_margin=inp.gross_margin,
     )
     after = compute(bumped)
+    incremental_revenue = after.revenue - base.revenue
+    incremental_gross_profit = after.gross_profit - base.gross_profit
     return {
         "uplift": relative_uplift,
         "stage": k,
         "revenue_before": base.revenue,
         "revenue_after": after.revenue,
-        "incremental_revenue": after.revenue - base.revenue,
+        "incremental_revenue": incremental_revenue,
+        "incremental_gross_profit": incremental_gross_profit,
         "roas_before": base.roas,
         "roas_after": after.roas,
     }
